@@ -1,0 +1,30 @@
+# --- Backend (Python) ---
+backend/.venv/
+backend/storage/
+backend/**/__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- Frontend (Node) ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Logs ---
+*.log
+npm-debug.log*
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# --- Claude Code local session config ---
+.claude/settings.local.json

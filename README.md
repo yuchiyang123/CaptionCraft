@@ -26,7 +26,24 @@ backend/    FastAPI 服務、SQLite 資料庫、faster-whisper 語音辨識、�
 frontend/   Vue 3 + Vite 前端
 ```
 
-## 啟動後端
+## 一鍵啟動（Docker，推薦）
+
+需要先安裝 [Docker](https://docs.docker.com/get-docker/) 與 Docker Compose（新版 Docker Desktop 已內建）。
+
+```bash
+docker compose up --build
+```
+
+啟動後開啟 **http://localhost:3000** 即可使用。前端由 nginx 提供靜態檔並將 `/api` 反向代理到後端，後端則跑在容器內的 `8000` port（同時也對外開放方便直接除錯）。
+
+- 影片、縮圖、資料庫會存在 Docker volume `backend_storage`，重開容器不會遺失
+- Whisper 模型會快取在 volume `whisper_cache`，只有第一次執行辨識才需要下載
+- 可用環境變數調整辨識設定（`docker-compose.yml` 裡的 `backend.environment`），意義同下方「啟動後端」章節的表格
+- 關閉：`docker compose down`（加 `-v` 會連同影片資料一起刪除）
+
+若不想用 Docker，也可以照下面步驟分別手動啟動前後端（開發模式，支援熱重載）。
+
+## 啟動後端（本機開發模式）
 
 ```bash
 cd backend
@@ -44,7 +61,7 @@ uvicorn app.main:app --reload --port 8000
 | `WHISPER_DEVICE` | `cpu` 或 `cuda` | `cpu` |
 | `WHISPER_COMPUTE_TYPE` | `int8`（CPU 較快）或 `float16` 等 | `int8` |
 
-## 啟動前端
+## 啟動前端（本機開發模式）
 
 ```bash
 cd frontend

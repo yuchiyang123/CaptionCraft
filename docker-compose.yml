@@ -1,0 +1,25 @@
+services:
+  backend:
+    build: ./backend
+    environment:
+      - WHISPER_MODEL_SIZE=small
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+    volumes:
+      - backend_storage:/app/storage
+      - whisper_cache:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+
+volumes:
+  backend_storage:
+  whisper_cache:

@@ -6,19 +6,52 @@ from .database import SessionLocal
 from .models import Video
 
 _FONT_CANDIDATES = [
+    # Windows
     r"C:\Windows\Fonts\msjh.ttc",
     r"C:\Windows\Fonts\msyh.ttc",
     r"C:\Windows\Fonts\mingliu.ttc",
     r"C:\Windows\Fonts\simsun.ttc",
+    # macOS
     "/System/Library/Fonts/PingFang.ttc",
+    # Debian/Ubuntu (fonts-noto-cjk package)
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    # Alpine (font-noto-cjk package)
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    # WenQuanYi (common fallback CJK font on minimal Linux images)
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
 ]
+
+_font_path_cache = None
 
 
 def _find_font():
+    global _font_path_cache
+    if _font_path_cache is not None:
+        return _font_path_cache or None
+
     for path in _FONT_CANDIDATES:
         if os.path.exists(path):
+            _font_path_cache = path
             return path
+
+    # Fall back to scanning common Linux font directories for any CJK-capable font.
+    search_roots = ["/usr/share/fonts", "/usr/local/share/fonts"]
+    keywords = ("cjk", "noto", "wqy", "droid sans fallback", "source-han")
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                if name.lower().endswith((".ttc", ".ttf", ".otf")) and any(
+                    kw in name.lower() for kw in keywords
+                ):
+                    found = os.path.join(dirpath, name)
+                    _font_path_cache = found
+                    return found
+
+    _font_path_cache = ""
     return None
 
 

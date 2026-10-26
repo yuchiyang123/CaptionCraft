@@ -7,3 +7,4 @@ pydantic==2.9.2
 requests==2.32.3
 Pillow==10.4.0
 av==12.3.0
+mediapipe==1.1.1

@@ -37,10 +37,50 @@ class VideoOut(BaseModel):
     render_status: str = "idle"
     render_error: Optional[str] = None
     render_progress: float = 0.0
+    render_note: Optional[str] = None
     style_font_size: int = 32
     style_position: str = "bottom"
     style_color: str = "#ffffff"
     style_bg_opacity: float = 0.65
+    av_offset: float = 0.0
+    sync_status: str = "idle"
+    sync_error: Optional[str] = None
+    sync_progress: float = 0.0
+    sync_detected_offset: Optional[float] = None
+    sync_confidence: Optional[str] = None
+    sync_windows: Optional[str] = None
+    sync_follow_subtitles: bool = True
+    enh_brightness: float = 1.0
+    enh_contrast: float = 1.0
+    enh_saturation: float = 1.0
+    enh_sharpness: float = 0.0
+    enh_denoise: float = 0.0
+    enh_target_height: int = 0
+    enh_upscale_method: str = "lanczos"
+    enh_sr_model: str = "fast"
+    enh_sr_detail: float = 0.5
+
+
+class SyncAnalyzeRequest(BaseModel):
+    start: Optional[float] = None  # seconds; omit both for the whole video
+    end: Optional[float] = None
+
+
+class SyncUpdate(BaseModel):
+    av_offset: Optional[float] = None
+    follow_subtitles: Optional[bool] = None
+
+
+class EnhanceUpdate(BaseModel):
+    brightness: Optional[float] = None
+    contrast: Optional[float] = None
+    saturation: Optional[float] = None
+    sharpness: Optional[float] = None
+    denoise: Optional[float] = None
+    target_height: Optional[int] = None
+    upscale_method: Optional[str] = None
+    sr_model: Optional[str] = None
+    sr_detail: Optional[float] = None
 
 
 class StyleUpdate(BaseModel):

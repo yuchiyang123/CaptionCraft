@@ -6,6 +6,10 @@ backend/**/__pycache__/
 *.py[cod]
 *.egg-info/
 
+# --- GPU upscaler service (runs on the GPU box) ---
+upscaler/.venv/
+upscaler/data/
+
 # --- Frontend (Node) ---
 frontend/node_modules/
 frontend/dist/

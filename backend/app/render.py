@@ -1,6 +1,8 @@
 import os
 import threading
+from fractions import Fraction
 
+from . import enhance, remote_upscale
 from .config import MEDIA_DIR
 from .database import SessionLocal
 from .models import Video
@@ -152,33 +154,49 @@ def _active_text(subtitles, t):
     return None
 
 
-def _burn_video_track(input_path, output_path, subtitles, style, on_progress=None):
+def _encode_video_track(input_path, output_path, subtitles, style, enhance_params, on_progress=None):
+    """Re-encode the video track with picture enhancement and burned-in subtitles."""
     import av
     from PIL import ImageFont
 
-    font_path = _find_font()
-    font_size = style.get("font_size", 32)
-    font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
+    from .enhance import FrameFilter
 
     in_container = av.open(input_path)
     in_stream = in_container.streams.video[0]
+    in_stream.thread_type = "AUTO"
     rate = in_stream.average_rate or 24
 
     total_duration = float(in_container.duration) / 1_000_000 if in_container.duration else None
 
+    frame_filter = FrameFilter(in_stream, enhance_params)
+
+    font_path = _find_font()
+    # keep captions the same size relative to the picture when upscaling
+    font_size = max(8, int(round(style.get("font_size", 32) * frame_filter.scale)))
+    font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
+
     out_container = av.open(output_path, mode="w")
     out_stream = out_container.add_stream("libx264", rate=rate)
-    out_stream.width = in_stream.width
-    out_stream.height = in_stream.height
     out_stream.pix_fmt = "yuv420p"
     out_stream.options = {"crf": "23", "preset": "veryfast"}
+    size_set = False
+    out_time_base = Fraction(1, 1) / Fraction(rate)
+    frame_index = 0
 
     last_reported = -1.0
-    for frame in in_container.decode(in_stream):
-        t = float(frame.pts * in_stream.time_base) if frame.pts is not None else float(frame.time or 0)
+
+    def encode(frame):
+        nonlocal size_set, last_reported, frame_index
+        if not size_set:
+            out_stream.width = frame.width
+            out_stream.height = frame.height
+            size_set = True
+
+        tb = frame.time_base or in_stream.time_base
+        t = float(frame.pts * tb) if frame.pts is not None else 0.0
         text = _active_text(subtitles, t)
-        img = frame.to_image().convert("RGBA")
         if text:
+            img = frame.to_image().convert("RGBA")
             _draw_caption(
                 img,
                 text,
@@ -187,7 +205,15 @@ def _burn_video_track(input_path, output_path, subtitles, style, on_progress=Non
                 color=style.get("color", "#ffffff"),
                 bg_opacity=style.get("bg_opacity", 0.65),
             )
-        new_frame = av.VideoFrame.from_image(img.convert("RGB"))
+            new_frame = av.VideoFrame.from_image(img.convert("RGB"))
+        else:
+            # no caption on this frame: skip the slow PIL round-trip
+            new_frame = frame.reformat(format="yuv420p")
+        # number frames explicitly: a reformatted frame keeps the input time_base,
+        # and leaving pts unset then makes the encoder emit duplicate timestamps
+        new_frame.pts = frame_index
+        new_frame.time_base = out_time_base
+        frame_index += 1
 
         for packet in out_stream.encode(new_frame):
             out_container.mux(packet)
@@ -198,48 +224,71 @@ def _burn_video_track(input_path, output_path, subtitles, style, on_progress=Non
                 on_progress(fraction)
                 last_reported = fraction
 
-    for packet in out_stream.encode():
-        out_container.mux(packet)
+    try:
+        for frame in in_container.decode(in_stream):
+            for out_frame in frame_filter.process(frame):
+                encode(out_frame)
+        for out_frame in frame_filter.flush():
+            encode(out_frame)
 
-    out_container.close()
-    in_container.close()
+        for packet in out_stream.encode():
+            out_container.mux(packet)
+    finally:
+        # always release the files, or Windows keeps them locked (video delete fails)
+        out_container.close()
+        in_container.close()
 
 
-def _copy_audio_track(input_path, video_only_path, final_path):
+def _copy_audio_track(input_path, video_source_path, final_path, audio_offset=0.0, video_source_is_temp=True):
+    """Mux the video track of video_source_path with the audio of input_path.
+    A non-zero audio_offset re-encodes the audio shifted by that many seconds."""
     import av
+
+    from .avsync import encode_shifted_audio
 
     in_container = av.open(input_path)
     audio_streams = in_container.streams.audio
-    if not audio_streams:
+    if not audio_streams and video_source_is_temp:
         in_container.close()
-        os.replace(video_only_path, final_path)
+        os.replace(video_source_path, final_path)
         return
 
-    in_audio = audio_streams[0]
+    in_audio = audio_streams[0] if audio_streams else None
 
-    video_container = av.open(video_only_path)
-    video_stream = video_container.streams.video[0]
-
+    video_container = av.open(video_source_path)
     out_container = av.open(final_path, mode="w")
-    out_video_stream = out_container.add_stream(template=video_stream)
-    out_audio_stream = out_container.add_stream(template=in_audio)
+    try:
+        video_stream = video_container.streams.video[0]
+        out_video_stream = out_container.add_stream(template=video_stream)
+        out_audio_stream = None
+        if in_audio is not None:
+            if audio_offset:
+                out_audio_stream = out_container.add_stream("aac", rate=in_audio.rate or 48000)
+                out_audio_stream.layout = in_audio.layout.name if in_audio.layout else "stereo"
+            else:
+                out_audio_stream = out_container.add_stream(template=in_audio)
 
-    for packet in video_container.demux(video_stream):
-        if packet.dts is None:
-            continue
-        packet.stream = out_video_stream
-        out_container.mux(packet)
+        for packet in video_container.demux(video_stream):
+            if packet.dts is None:
+                continue
+            packet.stream = out_video_stream
+            out_container.mux(packet)
 
-    for packet in in_container.demux(in_audio):
-        if packet.dts is None:
-            continue
-        packet.stream = out_audio_stream
-        out_container.mux(packet)
-
-    out_container.close()
-    video_container.close()
-    in_container.close()
-    os.remove(video_only_path)
+        if in_audio is not None:
+            if audio_offset:
+                encode_shifted_audio(in_container, in_audio, out_container, out_audio_stream, audio_offset)
+            else:
+                for packet in in_container.demux(in_audio):
+                    if packet.dts is None:
+                        continue
+                    packet.stream = out_audio_stream
+                    out_container.mux(packet)
+    finally:
+        out_container.close()
+        video_container.close()
+        in_container.close()
+    if video_source_is_temp:
+        os.remove(video_source_path)
 
 
 def run_render(video_id: str):
@@ -250,16 +299,23 @@ def run_render(video_id: str):
             return
         video.render_status = "rendering"
         video.render_error = None
+        video.render_note = None
         video.render_progress = 0.0
         db.commit()
 
+        # progress band [lo, hi] of the overall bar for the current phase
+        phase = {"lo": 0.0, "hi": 0.95}
+
         def on_progress(fraction):
-            video.render_progress = round(fraction * 0.95, 3)
+            video.render_progress = round(phase["lo"] + fraction * (phase["hi"] - phase["lo"]), 3)
             db.commit()
 
         input_path = os.path.join(MEDIA_DIR, video.filename)
+        audio_offset = video.av_offset or 0.0
+        # subtitles were timed against the original audio, so by default they move with it
+        sub_shift = audio_offset if video.sync_follow_subtitles != 0 else 0.0
         subtitles = [
-            {"start": s.start, "end": s.end, "text": s.text}
+            {"start": s.start + sub_shift, "end": s.end + sub_shift, "text": s.text}
             for s in sorted(video.subtitles, key=lambda s: s.start)
             if s.text.strip()
         ]
@@ -274,11 +330,44 @@ def run_render(video_id: str):
         final_path = rendered_path(video.filename)
         video_only_path = final_path + ".video_only.mp4"
 
-        _burn_video_track(input_path, video_only_path, subtitles, style, on_progress=on_progress)
-        video.render_progress = 0.97
-        db.commit()
+        enhance_params = enhance.params_from_video(video)
 
-        _copy_audio_track(input_path, video_only_path, final_path)
+        if subtitles or enhance.is_active(enhance_params):
+            video_source = input_path
+            upscaled_path = None
+            target = enhance.upscale_target(input_path, enhance_params)
+            if target and enhance_params["upscale_method"] == "ai":
+                # Real-ESRGAN on the GPU box first; colour filters / captions / audio stay local
+                phase.update(lo=0.0, hi=0.6)
+                try:
+                    upscaled_path = remote_upscale.upscale_video(
+                        input_path,
+                        *target,
+                        model=enhance_params["sr_model"],
+                        detail=enhance_params["sr_detail"],
+                        on_progress=on_progress,
+                    )
+                    video_source = upscaled_path
+                    enhance_params = dict(enhance_params, target_height=0)
+                except remote_upscale.UpscalerUnavailable as exc:
+                    video.render_note = f"{exc}；這次改用本機輕量 AI 放大（效果較弱）。"
+                    db.commit()
+                phase.update(lo=video.render_progress, hi=0.95)
+            try:
+                _encode_video_track(
+                    video_source, video_only_path, subtitles, style, enhance_params, on_progress=on_progress
+                )
+            finally:
+                if upscaled_path and os.path.exists(upscaled_path):
+                    os.remove(upscaled_path)
+            video.render_progress = 0.97
+            db.commit()
+            _copy_audio_track(input_path, video_only_path, final_path, audio_offset=audio_offset)
+        else:
+            # audio-only change: keep the original video packets, only shift the audio
+            _copy_audio_track(
+                input_path, input_path, final_path, audio_offset=audio_offset, video_source_is_temp=False
+            )
 
         video.render_status = "ready"
         video.render_progress = 1.0
@@ -287,6 +376,12 @@ def run_render(video_id: str):
         db.rollback()
         video = db.query(Video).filter(Video.id == video_id).first()
         if video:
+            leftover = rendered_path(video.filename) + ".video_only.mp4"
+            if os.path.exists(leftover):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
             video.render_status = "error"
             video.render_error = str(exc)
             db.commit()

@@ -2,13 +2,15 @@ import os
 import re
 import shutil
 import uuid
+from typing import Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Request, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 
-from .. import models, schemas
+from .. import enhance, models, remote_upscale, schemas
+from ..avsync import start_sync_analysis_background
 from ..config import MEDIA_DIR
 from ..database import get_db
 from ..media import get_media_duration, generate_thumbnail, thumbnail_path
@@ -265,6 +267,112 @@ def update_style(video_id: str, payload: schemas.StyleUpdate, db: Session = Depe
     return video
 
 
+@router.post("/{video_id}/sync/analyze", response_model=schemas.VideoOut)
+def analyze_sync(
+    video_id: str, payload: Optional[schemas.SyncAnalyzeRequest] = None, db: Session = Depends(get_db)
+):
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(404, "找不到影片")
+    if video.sync_status == "analyzing":
+        raise HTTPException(409, "音畫同步正在分析中")
+
+    start = payload.start if payload else None
+    end = payload.end if payload else None
+    if start is not None or end is not None:
+        s = max(0.0, start or 0.0)
+        e = min(video.duration or float("inf"), end if end is not None else float("inf"))
+        if e - s < 5:
+            raise HTTPException(400, "檢測範圍至少要 5 秒")
+
+    video.sync_status = "analyzing"
+    video.sync_error = None
+    video.sync_progress = 0.0
+    db.commit()
+
+    start_sync_analysis_background(video_id, start, end)
+
+    db.refresh(video)
+    return video
+
+
+@router.patch("/{video_id}/sync", response_model=schemas.VideoOut)
+def update_sync(video_id: str, payload: schemas.SyncUpdate, db: Session = Depends(get_db)):
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(404, "找不到影片")
+
+    if payload.av_offset is not None:
+        video.av_offset = round(max(-10.0, min(10.0, payload.av_offset)), 3)
+    if payload.follow_subtitles is not None:
+        video.sync_follow_subtitles = 1 if payload.follow_subtitles else 0
+    invalidate_render(video)
+    db.commit()
+    db.refresh(video)
+    return video
+
+
+@router.patch("/{video_id}/enhance", response_model=schemas.VideoOut)
+def update_enhance(video_id: str, payload: schemas.EnhanceUpdate, db: Session = Depends(get_db)):
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(404, "找不到影片")
+
+    values = payload.model_dump(exclude_none=True)
+    target_height = values.pop("target_height", None)
+    method = values.pop("upscale_method", None)
+    sr_model = values.pop("sr_model", None)
+    sr_detail = values.pop("sr_detail", None)
+    if sr_model is not None:
+        if sr_model not in enhance.SR_MODELS:
+            raise HTTPException(400, "不支援的 AI 模型")
+        video.enh_sr_model = sr_model
+    if sr_detail is not None:
+        video.enh_sr_detail = round(max(0.0, min(1.0, sr_detail)), 2)
+    if target_height is not None:
+        if target_height not in enhance.TARGET_HEIGHTS:
+            raise HTTPException(400, "不支援的輸出解析度")
+        video.enh_target_height = target_height
+    if method is not None:
+        if method not in enhance.UPSCALE_METHODS:
+            raise HTTPException(400, "不支援的放大方式")
+        video.enh_upscale_method = method
+    for name, value in values.items():
+        setattr(video, f"enh_{name}", round(enhance.clamp(name, value), 3))
+    invalidate_render(video)
+    db.commit()
+    db.refresh(video)
+    return video
+
+
+@router.get("/{video_id}/enhance/preview")
+def preview_enhance(video_id: str, t: float = 0.0, db: Session = Depends(get_db)):
+    """One frame at time t with the current enhancement (incl. upscaling) applied."""
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(404, "找不到影片")
+    media_path = os.path.join(MEDIA_DIR, video.filename)
+    params = enhance.params_from_video(video)
+    headers = {"Cache-Control": "no-store", "X-Upscaler": "local"}
+    try:
+        target = enhance.upscale_target(media_path, params)
+        if target and params["upscale_method"] == "ai":
+            # same split as the export: filters locally, Real-ESRGAN on the GPU box
+            try:
+                base = enhance.render_preview_jpeg(media_path, t, dict(params, target_height=0), quality=97)
+                data = remote_upscale.upscale_frame_jpeg(
+                    base, *target, model=params["sr_model"], detail=params["sr_detail"]
+                )
+                headers["X-Upscaler"] = "gpu"
+                return Response(content=data, media_type="image/jpeg", headers=headers)
+            except remote_upscale.UpscalerUnavailable:
+                pass
+        data = enhance.render_preview_jpeg(media_path, t, params)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return Response(content=data, media_type="image/jpeg", headers=headers)
+
+
 @router.post("/{video_id}/render", response_model=schemas.VideoOut)
 def render_video(video_id: str, db: Session = Depends(get_db)):
     video = db.query(models.Video).filter(models.Video.id == video_id).first()
@@ -272,11 +380,12 @@ def render_video(video_id: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "找不到影片")
     if video.render_status == "rendering":
         raise HTTPException(409, "影片正在匯出中")
-    if not video.subtitles:
-        raise HTTPException(400, "尚無字幕可以匯出")
+    if not video.subtitles and not video.av_offset and not enhance.is_active(enhance.params_from_video(video)):
+        raise HTTPException(400, "尚無字幕、音畫同步或畫質調整可以匯出")
 
     video.render_status = "rendering"
     video.render_error = None
+    video.render_note = None
     video.render_progress = 0.0
     db.commit()
 
@@ -297,8 +406,9 @@ def download_rendered_video(video_id: str, request: Request, db: Session = Depen
     if not os.path.exists(out_path):
         raise HTTPException(404, "找不到匯出的檔案")
     base_name = os.path.splitext(video.original_name)[0]
+    suffix = "captioned" if video.subtitles else "edited"
     return _ranged_file_response(
-        out_path, request, "video/mp4", download_filename=f"{base_name}_captioned.mp4"
+        out_path, request, "video/mp4", download_filename=f"{base_name}_{suffix}.mp4"
     )
 
 
